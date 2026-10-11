@@ -2,6 +2,7 @@ package com.example.browser
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
@@ -17,6 +18,7 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ProgressBar
+import android.widget.Toast
 
 class MainActivity : Activity() {
 
@@ -24,6 +26,7 @@ class MainActivity : Activity() {
     private lateinit var urlBar: EditText
     private lateinit var progress: ProgressBar
     private val home = "https://www.google.com"
+    private var dialogShowing = false
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -48,13 +51,10 @@ class MainActivity : Activity() {
             }
 
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                val url = request.url.toString()
+                val uri = request.url
+                val url = uri.toString()
                 if (url.startsWith("http://") || url.startsWith("https://")) return false
-                try {
-                    startActivity(Intent(Intent.ACTION_VIEW, request.url))
-                } catch (e: Exception) {
-                    // no app can open this link, so ignore it
-                }
+                askToOpenApp(uri)
                 return true
             }
         }
@@ -87,6 +87,24 @@ class MainActivity : Activity() {
         }
 
         web.loadUrl(home)
+    }
+
+    private fun askToOpenApp(uri: Uri) {
+        if (dialogShowing) return
+        dialogShowing = true
+        AlertDialog.Builder(this)
+            .setTitle("Open another app?")
+            .setMessage("This site wants to open an app on your phone.")
+            .setPositiveButton("Open") { _, _ ->
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, uri))
+                } catch (e: Exception) {
+                    Toast.makeText(this, "No app found to open this link", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Stay here", null)
+            .setOnDismissListener { dialogShowing = false }
+            .show()
     }
 
     private fun go() {
