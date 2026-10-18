@@ -47,6 +47,8 @@ class MainActivity : Activity() {
     private val home = "https://www.google.com"
     private val desktopUA =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    private val firefoxUA =
+        "Mozilla/5.0 (Android 14; Mobile; rv:125.0) Gecko/125.0 Firefox/125.0"
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
 
     private fun desktopOn() = prefs.getBoolean("desktop", false)
@@ -107,12 +109,16 @@ class MainActivity : Activity() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val uri = request.url
                 if (isHttp(uri)) {
-                    if (desktopOn()) {
-                        val fixed = desktopUrl(uri.toString())
-                        if (fixed != uri.toString()) {
-                            view.loadUrl(fixed)
-                            return true
-                        }
+                    val target = uri.toString()
+                    val fixed = desktopUrl(target)
+                    val wantedUA = uaFor(fixed)
+                    // Reload with the right address / user agent when they need to change
+                    if (request.method == "GET" &&
+                        (fixed != target || wantedUA != view.settings.userAgentString)
+                    ) {
+                        view.settings.userAgentString = wantedUA
+                        view.loadUrl(fixed)
+                        return true
                     }
                     return false
                 }
@@ -219,7 +225,7 @@ class MainActivity : Activity() {
             }
         }
 
-        web.loadUrl(desktopUrl(home))
+        load(home)
     }
 
     // ---------- fullscreen video ----------
@@ -250,6 +256,30 @@ class MainActivity : Activity() {
         if (!desktopOn()) return url
         val host = Uri.parse(url).host ?: return url
         return if (host.startsWith("m.")) url.replaceFirst("//m.", "//www.") else url
+    }
+
+    // ---------- user agent ----------
+
+    private fun isGoogleLogin(url: String?): Boolean {
+        if (url == null) return false
+        return Uri.parse(url).host == "accounts.google.com"
+    }
+
+    private fun uaFor(url: String?): String = when {
+        isGoogleLogin(url) -> firefoxUA
+        desktopOn() -> desktopUA
+        else -> mobileUA
+    }
+
+    private fun applyUserAgent() {
+        web.settings.userAgentString = uaFor(web.url)
+    }
+
+    // Load a page with the right address and user agent
+    private fun load(url: String) {
+        val fixed = desktopUrl(url)
+        web.settings.userAgentString = uaFor(fixed)
+        web.loadUrl(fixed)
     }
 
     // ---------- top banner (does not pause or dim the page) ----------
@@ -286,11 +316,11 @@ class MainActivity : Activity() {
         if (isHttp(uri)) {
             val url = uri.toString()
             if (!askNew()) {
-                web.loadUrl(desktopUrl(url)) // popup off = just open it here
+                load(url) // popup off = just open it here
                 return
             }
             showBanner("This site wants to open a new page:\n$url") {
-                web.loadUrl(desktopUrl(url))
+                load(url)
             }
         } else if (!isInternal(uri)) {
             handleAppLink(uri)
@@ -299,20 +329,10 @@ class MainActivity : Activity() {
 
     // ---------- desktop site + settings ----------
 
-    private fun applyUserAgent() {
-        web.settings.userAgentString = if (desktopOn()) desktopUA else mobileUA
-    }
-
     private fun setDesktop(enabled: Boolean) {
         prefs.edit().putBoolean("desktop", enabled).apply()
-        applyUserAgent()
         val current = web.url
-        if (enabled && current != null) {
-            val fixed = desktopUrl(current)
-            if (fixed != current) web.loadUrl(fixed) else web.reload()
-        } else {
-            web.reload()
-        }
+        if (current != null) load(current) else applyUserAgent()
     }
 
     private fun showMenu(anchor: View) {
@@ -371,7 +391,7 @@ class MainActivity : Activity() {
             else -> "https://www.google.com/search?q=" + Uri.encode(q)
         }
         hideBanner()
-        web.loadUrl(desktopUrl(url))
+        load(url)
         val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
         imm.hideSoftInputFromWindow(urlBar.windowToken, 0)
     }
