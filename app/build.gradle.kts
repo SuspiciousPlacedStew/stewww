@@ -5,14 +5,18 @@ plugins {
 
 android {
     namespace = "com.example.browser"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.browser"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     compileOptions {
@@ -25,5 +29,5 @@ android {
 }
 
 dependencies {
-    implementation("androidx.webkit:webkit:1.11.0")
+    implementation("org.mozilla.geckoview:geckoview:150.0.20260511200624")
 }
