@@ -18,6 +18,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import org.mozilla.geckoview.AllowOrDeny
+import org.mozilla.geckoview.ContentBlocking
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
@@ -51,6 +52,7 @@ class MainActivity : Activity() {
     private fun desktopOn() = prefs.getBoolean("desktop", false)
     private fun askApps() = prefs.getBoolean("askApps", true)
     private fun askNew() = prefs.getBoolean("askNew", true)
+    private fun blockOn() = prefs.getBoolean("block", true)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -94,6 +96,17 @@ class MainActivity : Activity() {
         load(home)
     }
 
+    // Idle the page while the app is in the background to save memory
+    override fun onStart() {
+        super.onStart()
+        session.setActive(true)
+    }
+
+    override fun onStop() {
+        session.setActive(false)
+        super.onStop()
+    }
+
     override fun onDestroy() {
         session.close()
         super.onDestroy()
@@ -105,11 +118,30 @@ class MainActivity : Activity() {
     private fun runtimeInstance(): GeckoRuntime =
         runtime ?: GeckoRuntime.create(applicationContext).also { runtime = it }
 
+    // Ad / tracker blocking (lighter pages, less memory)
+    private fun applyBlocking(rt: GeckoRuntime) {
+        val cb = rt.settings.contentBlocking
+        if (blockOn()) {
+            cb.setEnhancedTrackingProtectionLevel(ContentBlocking.EtpLevel.STRICT)
+            cb.setAntiTracking(
+                ContentBlocking.AntiTracking.AD or
+                        ContentBlocking.AntiTracking.ANALYTIC or
+                        ContentBlocking.AntiTracking.SOCIAL or
+                        ContentBlocking.AntiTracking.CRYPTOMINING
+            )
+        } else {
+            cb.setEnhancedTrackingProtectionLevel(ContentBlocking.EtpLevel.NONE)
+            cb.setAntiTracking(ContentBlocking.AntiTracking.NONE)
+        }
+    }
+
     private fun createSession() {
+        val rt = runtimeInstance()
+        applyBlocking(rt)
         session = GeckoSession()
         applyDesktopMode()
         setupDelegates()
-        session.open(runtimeInstance())
+        session.open(rt)
         geckoView.setSession(session)
     }
 
@@ -325,6 +357,12 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun setBlocking(enabled: Boolean) {
+        prefs.edit().putBoolean("block", enabled).apply()
+        applyBlocking(runtimeInstance())
+        session.reload()
+    }
+
     private fun showMenu(anchor: View) {
         val popup = PopupMenu(this, anchor)
         val desktopItem = popup.menu.add(Menu.NONE, 1, 0, "Desktop site")
@@ -351,19 +389,20 @@ class MainActivity : Activity() {
         val items = arrayOf(
             "Desktop site",
             "Ask before opening apps",
-            "Ask before opening new sites"
+            "Ask before opening new sites",
+            "Block ads and trackers"
         )
-        val keys = arrayOf("desktop", "askApps", "askNew")
-        val defaults = booleanArrayOf(false, true, true)
-        val checked = BooleanArray(3) { prefs.getBoolean(keys[it], defaults[it]) }
+        val keys = arrayOf("desktop", "askApps", "askNew", "block")
+        val defaults = booleanArrayOf(false, true, true, true)
+        val checked = BooleanArray(4) { prefs.getBoolean(keys[it], defaults[it]) }
 
         AlertDialog.Builder(this)
             .setTitle("Settings")
             .setMultiChoiceItems(items, checked) { _, which, isChecked ->
-                if (which == 0) {
-                    setDesktop(isChecked)
-                } else {
-                    prefs.edit().putBoolean(keys[which], isChecked).apply()
+                when (which) {
+                    0 -> setDesktop(isChecked)
+                    3 -> setBlocking(isChecked)
+                    else -> prefs.edit().putBoolean(keys[which], isChecked).apply()
                 }
             }
             .setPositiveButton("Done", null)
