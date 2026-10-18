@@ -44,13 +44,8 @@ class MainActivity : Activity() {
     private var forwardEnabled = false
     private var inFullscreen = false
     private var lastUrl = ""
-    private var currentUA: String? = null
 
     private val home = "https://www.google.com"
-    private val chromeMobileUA =
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-    private val chromeDesktopUA =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
 
     private fun desktopOn() = prefs.getBoolean("desktop", false)
@@ -150,21 +145,12 @@ class MainActivity : Activity() {
                             geckoView.post { handleNewPage(uriStr) }
                             deny()
                         } else {
-                            // Switch the browser ID for sites that need it, then reload
-                            val wantedUA = uaOverrideFor(uriStr)
-                            if (wantedUA != currentUA) {
-                                currentUA = wantedUA
-                                session.settings.setUserAgentOverride(wantedUA)
-                                geckoView.post { session.loadUri(desktopUrl(uriStr)) }
+                            val fixed = desktopUrl(uriStr)
+                            if (fixed != uriStr) {
+                                geckoView.post { session.loadUri(fixed) }
                                 deny()
                             } else {
-                                val fixed = desktopUrl(uriStr)
-                                if (fixed != uriStr) {
-                                    geckoView.post { session.loadUri(fixed) }
-                                    deny()
-                                } else {
-                                    allow()
-                                }
+                                allow()
                             }
                         }
                     }
@@ -203,17 +189,6 @@ class MainActivity : Activity() {
                 setFullscreen(fullScreen)
             }
         }
-    }
-
-    // ---------- browser ID per site ----------
-
-    // TikTok gets a Chrome ID; everything else keeps the normal Firefox one
-    private fun uaOverrideFor(url: String): String? {
-        val host = Uri.parse(url).host ?: return null
-        val needsChrome = host == "tiktok.com" || host.endsWith(".tiktok.com") ||
-                host.endsWith(".tiktokv.com") || host.endsWith(".tiktokcdn.com")
-        if (!needsChrome) return null
-        return if (desktopOn()) chromeDesktopUA else chromeMobileUA
     }
 
     // ---------- fullscreen video ----------
@@ -312,9 +287,6 @@ class MainActivity : Activity() {
     private fun setDesktop(enabled: Boolean) {
         prefs.edit().putBoolean("desktop", enabled).apply()
         applyDesktopMode()
-        val wanted = uaOverrideFor(lastUrl)
-        currentUA = wanted
-        session.settings.setUserAgentOverride(wanted)
         val fixed = desktopUrl(lastUrl)
         if (lastUrl.isNotEmpty() && fixed != lastUrl) {
             session.loadUri(fixed)
