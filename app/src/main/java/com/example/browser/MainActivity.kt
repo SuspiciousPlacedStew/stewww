@@ -65,14 +65,7 @@ class MainActivity : Activity() {
         bannerOpen = findViewById(R.id.bannerOpen)
         bannerStay = findViewById(R.id.bannerStay)
 
-        // One GeckoRuntime per app process
-        val rt = runtime ?: GeckoRuntime.create(applicationContext).also { runtime = it }
-
-        session = GeckoSession()
-        applyDesktopMode()
-        setupDelegates()
-        session.open(rt)
-        geckoView.setSession(session)
+        createSession()
 
         findViewById<Button>(R.id.btnBack).setOnClickListener {
             if (backEnabled) session.goBack()
@@ -104,6 +97,35 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         session.close()
         super.onDestroy()
+    }
+
+    // ---------- session setup + crash recovery ----------
+
+    // One GeckoRuntime per app process
+    private fun runtimeInstance(): GeckoRuntime =
+        runtime ?: GeckoRuntime.create(applicationContext).also { runtime = it }
+
+    private fun createSession() {
+        session = GeckoSession()
+        applyDesktopMode()
+        setupDelegates()
+        session.open(runtimeInstance())
+        geckoView.setSession(session)
+    }
+
+    // When a page crashes, its session is dead: throw it away and start a new one
+    private fun recoverSession(message: String) {
+        if (inFullscreen) setFullscreen(false)
+        backEnabled = false
+        forwardEnabled = false
+        lastUrl = ""
+        hideBanner()
+        progressBar.visibility = View.GONE
+        geckoView.releaseSession()
+        session.close()
+        createSession()
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        load(home)
     }
 
     // ---------- GeckoView callbacks ----------
@@ -187,6 +209,14 @@ class MainActivity : Activity() {
         session.contentDelegate = object : GeckoSession.ContentDelegate {
             override fun onFullScreen(s: GeckoSession, fullScreen: Boolean) {
                 setFullscreen(fullScreen)
+            }
+
+            override fun onCrash(s: GeckoSession) {
+                geckoView.post { recoverSession("That page crashed, so the browser restarted") }
+            }
+
+            override fun onKill(s: GeckoSession) {
+                geckoView.post { recoverSession("The page ran out of memory and was closed") }
             }
         }
     }
