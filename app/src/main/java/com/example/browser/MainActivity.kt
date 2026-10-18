@@ -15,6 +15,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -26,6 +27,8 @@ import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 
 class MainActivity : Activity() {
 
@@ -74,7 +77,20 @@ class MainActivity : Activity() {
         s.setSupportMultipleWindows(true)
         s.mediaPlaybackRequiresUserGesture = false
 
+        // Cookies (needed for logins)
+        val cookies = CookieManager.getInstance()
+        cookies.setAcceptCookie(true)
+        cookies.setAcceptThirdPartyCookies(web, true)
+
+        // Stop sending the header that tells sites this is an app WebView
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+            WebSettingsCompat.setRequestedWithHeaderOriginAllowList(s, emptySet())
+        }
+
+        // Make the mobile user agent look like normal Chrome (remove the WebView markers)
         mobileUA = s.userAgentString
+            .replace("; wv", "")
+            .replace("Version/4.0 ", "")
         applyUserAgent()
 
         web.webViewClient = object : WebViewClient() {
@@ -85,6 +101,7 @@ class MainActivity : Activity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 progress.visibility = View.GONE
+                CookieManager.getInstance().flush()
             }
 
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
