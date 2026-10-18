@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
@@ -11,6 +12,7 @@ import android.os.Message
 import android.view.KeyEvent
 import android.view.Menu
 import android.view.View
+import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.WebChromeClient
@@ -19,6 +21,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -34,6 +37,9 @@ class MainActivity : Activity() {
     private lateinit var bannerOpen: Button
     private lateinit var bannerStay: Button
     private lateinit var mobileUA: String
+
+    private var customView: View? = null
+    private var customCallback: WebChromeClient.CustomViewCallback? = null
 
     private val home = "https://www.google.com"
     private val desktopUA =
@@ -66,6 +72,7 @@ class MainActivity : Activity() {
         s.builtInZoomControls = true
         s.displayZoomControls = false
         s.setSupportMultipleWindows(true)
+        s.mediaPlaybackRequiresUserGesture = false
 
         mobileUA = s.userAgentString
         applyUserAgent()
@@ -82,7 +89,17 @@ class MainActivity : Activity() {
 
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val uri = request.url
-                if (isHttp(uri) || isInternal(uri)) return false
+                if (isHttp(uri)) {
+                    if (desktopOn()) {
+                        val fixed = desktopUrl(uri.toString())
+                        if (fixed != uri.toString()) {
+                            view.loadUrl(fixed)
+                            return true
+                        }
+                    }
+                    return false
+                }
+                if (isInternal(uri)) return false
                 handleAppLink(uri)
                 return true
             }
@@ -91,6 +108,35 @@ class MainActivity : Activity() {
         web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView, newProgress: Int) {
                 progress.progress = newProgress
+            }
+
+            override fun onShowCustomView(view: View, callback: WebChromeClient.CustomViewCallback) {
+                if (customView != null) {
+                    callback.onCustomViewHidden()
+                    return
+                }
+                customView = view
+                customCallback = callback
+                val decor = window.decorView as FrameLayout
+                decor.addView(
+                    view,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                )
+                @Suppress("DEPRECATION")
+                decor.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
+                        or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                        or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            }
+
+            override fun onHideCustomView() {
+                exitFullscreen()
             }
 
             override fun onCreateWindow(
@@ -156,7 +202,21 @@ class MainActivity : Activity() {
             }
         }
 
-        web.loadUrl(home)
+        web.loadUrl(desktopUrl(home))
+    }
+
+    // ---------- fullscreen video ----------
+
+    private fun exitFullscreen() {
+        val v = customView ?: return
+        val decor = window.decorView as FrameLayout
+        decor.removeView(v)
+        customView = null
+        @Suppress("DEPRECATION")
+        decor.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        customCallback?.onCustomViewHidden()
+        customCallback = null
     }
 
     // ---------- link type helpers ----------
@@ -166,6 +226,13 @@ class MainActivity : Activity() {
     private fun isInternal(uri: Uri): Boolean {
         val scheme = uri.scheme ?: ""
         return scheme in listOf("about", "data", "blob", "javascript")
+    }
+
+    // In desktop mode, turn mobile addresses (m.example.com) into www.
+    private fun desktopUrl(url: String): String {
+        if (!desktopOn()) return url
+        val host = Uri.parse(url).host ?: return url
+        return if (host.startsWith("m.")) url.replaceFirst("//m.", "//www.") else url
     }
 
     // ---------- top banner (does not pause or dim the page) ----------
@@ -202,11 +269,11 @@ class MainActivity : Activity() {
         if (isHttp(uri)) {
             val url = uri.toString()
             if (!askNew()) {
-                web.loadUrl(url) // popup off = just open it here
+                web.loadUrl(desktopUrl(url)) // popup off = just open it here
                 return
             }
             showBanner("This site wants to open a new page:\n$url") {
-                web.loadUrl(url)
+                web.loadUrl(desktopUrl(url))
             }
         } else if (!isInternal(uri)) {
             handleAppLink(uri)
@@ -222,7 +289,13 @@ class MainActivity : Activity() {
     private fun setDesktop(enabled: Boolean) {
         prefs.edit().putBoolean("desktop", enabled).apply()
         applyUserAgent()
-        web.reload()
+        val current = web.url
+        if (enabled && current != null) {
+            val fixed = desktopUrl(current)
+            if (fixed != current) web.loadUrl(fixed) else web.reload()
+        } else {
+            web.reload()
+        }
     }
 
     private fun showMenu(anchor: View) {
@@ -281,13 +354,17 @@ class MainActivity : Activity() {
             else -> "https://www.google.com/search?q=" + Uri.encode(q)
         }
         hideBanner()
-        web.loadUrl(url)
+        web.loadUrl(desktopUrl(url))
         val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
         imm.hideSoftInputFromWindow(urlBar.windowToken, 0)
     }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (web.canGoBack()) web.goBack() else super.onBackPressed()
+        when {
+            customView != null -> exitFullscreen()
+            web.canGoBack() -> web.goBack()
+            else -> super.onBackPressed()
+        }
     }
 }
