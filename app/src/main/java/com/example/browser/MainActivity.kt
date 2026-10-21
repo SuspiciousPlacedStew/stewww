@@ -19,6 +19,7 @@ import android.widget.TextView
 import android.widget.Toast
 import org.mozilla.geckoview.AllowOrDeny
 import org.mozilla.geckoview.ContentBlocking
+import org.mozilla.geckoview.GeckoPreferenceController
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
@@ -53,6 +54,7 @@ class MainActivity : Activity() {
     private fun askApps() = prefs.getBoolean("askApps", true)
     private fun askNew() = prefs.getBoolean("askNew", true)
     private fun blockOn() = prefs.getBoolean("block", true)
+    private fun imagesOff() = prefs.getBoolean("noImages", false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -135,9 +137,21 @@ class MainActivity : Activity() {
         }
     }
 
+    // Engine memory settings
+    private fun applyMemoryPrefs() {
+        val user = GeckoPreferenceController.PREF_BRANCH_USER
+        // keep fewer old pages in memory for the back button
+        GeckoPreferenceController.setGeckoPref("browser.sessionhistory.max_total_viewers", 1, user)
+        // smaller decoded-image cache (64 MB)
+        GeckoPreferenceController.setGeckoPref("image.mem.surfacecache.max_size_kb", 65536, user)
+        // optional: block images entirely (2 = block, 1 = allow)
+        GeckoPreferenceController.setGeckoPref("permissions.default.image", if (imagesOff()) 2 else 1, user)
+    }
+
     private fun createSession() {
         val rt = runtimeInstance()
         applyBlocking(rt)
+        applyMemoryPrefs()
         session = GeckoSession()
         applyDesktopMode()
         setupDelegates()
@@ -363,6 +377,12 @@ class MainActivity : Activity() {
         session.reload()
     }
 
+    private fun setImagesOff(enabled: Boolean) {
+        prefs.edit().putBoolean("noImages", enabled).apply()
+        applyMemoryPrefs()
+        session.reload()
+    }
+
     private fun showMenu(anchor: View) {
         val popup = PopupMenu(this, anchor)
         val desktopItem = popup.menu.add(Menu.NONE, 1, 0, "Desktop site")
@@ -390,11 +410,12 @@ class MainActivity : Activity() {
             "Desktop site",
             "Ask before opening apps",
             "Ask before opening new sites",
-            "Block ads and trackers"
+            "Block ads and trackers",
+            "Save memory (block images)"
         )
-        val keys = arrayOf("desktop", "askApps", "askNew", "block")
-        val defaults = booleanArrayOf(false, true, true, true)
-        val checked = BooleanArray(4) { prefs.getBoolean(keys[it], defaults[it]) }
+        val keys = arrayOf("desktop", "askApps", "askNew", "block", "noImages")
+        val defaults = booleanArrayOf(false, true, true, true, false)
+        val checked = BooleanArray(5) { prefs.getBoolean(keys[it], defaults[it]) }
 
         AlertDialog.Builder(this)
             .setTitle("Settings")
@@ -402,6 +423,7 @@ class MainActivity : Activity() {
                 when (which) {
                     0 -> setDesktop(isChecked)
                     3 -> setBlocking(isChecked)
+                    4 -> setImagesOff(isChecked)
                     else -> prefs.edit().putBoolean(keys[which], isChecked).apply()
                 }
             }
