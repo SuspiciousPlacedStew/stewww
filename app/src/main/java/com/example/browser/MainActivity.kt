@@ -25,11 +25,13 @@ import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.WebExtension
 
 class MainActivity : Activity() {
 
     companion object {
         private var runtime: GeckoRuntime? = null
+        private var compatRequested = false
     }
 
     private lateinit var geckoView: GeckoView
@@ -120,6 +122,34 @@ class MainActivity : Activity() {
     private fun runtimeInstance(): GeckoRuntime =
         runtime ?: GeckoRuntime.create(applicationContext).also { runtime = it }
 
+    // Mozilla's site-fix add-on (the "web compat" fixes Firefox uses)
+    private fun installCompatFixes(rt: GeckoRuntime) {
+        if (compatRequested) return
+        compatRequested = true
+        rt.webExtensionController
+            .ensureBuiltIn("resource://android/assets/extensions/webcompat/", "webcompat@mozilla.org")
+            .accept(
+                object : GeckoResult.Consumer<WebExtension> {
+                    override fun accept(value: WebExtension?) {
+                        runOnUiThread {
+                            Toast.makeText(this@MainActivity, "Site fixes loaded", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                },
+                object : GeckoResult.Consumer<Throwable> {
+                    override fun accept(value: Throwable?) {
+                        runOnUiThread {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Site fixes failed: " + (value?.message ?: "unknown error"),
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                }
+            )
+    }
+
     // Ad / tracker blocking (lighter pages, less memory)
     private fun applyBlocking(rt: GeckoRuntime) {
         val cb = rt.settings.contentBlocking
@@ -152,6 +182,7 @@ class MainActivity : Activity() {
         val rt = runtimeInstance()
         applyBlocking(rt)
         applyMemoryPrefs()
+        installCompatFixes(rt)
         session = GeckoSession()
         applyDesktopMode()
         setupDelegates()
