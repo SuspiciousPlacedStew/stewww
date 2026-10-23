@@ -35,4 +35,5 @@ kotlin {
 
 dependencies {
     implementation("org.mozilla.geckoview:geckoview:150.0.20260511200624")
+    implementation("org.mozilla.components:feature-webcompat:150.+")
 }
