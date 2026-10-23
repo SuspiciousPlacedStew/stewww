@@ -34,5 +34,5 @@ kotlin {
 }
 
 dependencies {
-    implementation("org.mozilla.geckoview:geckoview:157.0.20261005135250")
+    implementation("org.mozilla.geckoview:geckoview:153.+")
 }
