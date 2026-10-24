@@ -9,31 +9,20 @@ import android.os.Bundle
 import android.view.KeyEvent
 import android.view.Menu
 import android.view.View
+import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
-import org.mozilla.geckoview.AllowOrDeny
-import org.mozilla.geckoview.ContentBlocking
-import org.mozilla.geckoview.GeckoPreferenceController
-import org.mozilla.geckoview.GeckoResult
-import org.mozilla.geckoview.GeckoRuntime
-import org.mozilla.geckoview.GeckoSession
-import org.mozilla.geckoview.GeckoSessionSettings
-import org.mozilla.geckoview.GeckoView
 
-class MainActivity : Activity() {
+class MainActivity : Activity(), EngineCallbacks {
 
-    companion object {
-        private var runtime: GeckoRuntime? = null
-    }
-
-    private lateinit var geckoView: GeckoView
-    private lateinit var session: GeckoSession
+    private lateinit var engineHost: FrameLayout
     private lateinit var topBar: View
     private lateinit var urlBar: EditText
     private lateinit var progressBar: ProgressBar
@@ -42,25 +31,26 @@ class MainActivity : Activity() {
     private lateinit var bannerOpen: Button
     private lateinit var bannerStay: Button
 
+    private var engine: BrowserEngine? = null
     private var backEnabled = false
     private var forwardEnabled = false
     private var inFullscreen = false
-    private var lastUrl = ""
+    private var fullscreenView: View? = null
 
     private val home = "https://www.google.com"
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
 
+    private fun engineName() = prefs.getString("engine", "webview") ?: "webview"
     private fun desktopOn() = prefs.getBoolean("desktop", false)
     private fun askApps() = prefs.getBoolean("askApps", true)
     private fun askNew() = prefs.getBoolean("askNew", true)
-    private fun blockOn() = prefs.getBoolean("block", true)
     private fun imagesOff() = prefs.getBoolean("noImages", false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        geckoView = findViewById(R.id.geckoview)
+        engineHost = findViewById(R.id.engineHost)
         topBar = findViewById(R.id.topBar)
         urlBar = findViewById(R.id.urlBar)
         progressBar = findViewById(R.id.progress)
@@ -69,16 +59,16 @@ class MainActivity : Activity() {
         bannerOpen = findViewById(R.id.bannerOpen)
         bannerStay = findViewById(R.id.bannerStay)
 
-        createSession()
+        startEngine()
 
         findViewById<Button>(R.id.btnBack).setOnClickListener {
-            if (backEnabled) session.goBack()
+            if (backEnabled) engine?.goBack()
         }
         findViewById<Button>(R.id.btnForward).setOnClickListener {
-            if (forwardEnabled) session.goForward()
+            if (forwardEnabled) engine?.goForward()
         }
         findViewById<Button>(R.id.btnReload).setOnClickListener {
-            session.reload()
+            engine?.reload()
         }
         findViewById<Button>(R.id.btnMenu).setOnClickListener { v ->
             showMenu(v)
@@ -95,217 +85,129 @@ class MainActivity : Activity() {
             }
         }
 
-        load(home)
+        // After an engine switch, reopen the page that was open
+        val resume = prefs.getString("resumeUrl", null)
+        prefs.edit().remove("resumeUrl").apply()
+        engine?.load(if (!resume.isNullOrEmpty()) resume else home)
     }
 
-    // Idle the page while the app is in the background to save memory
     override fun onStart() {
         super.onStart()
-        session.setActive(true)
+        engine?.setActive(true)
     }
 
     override fun onStop() {
-        session.setActive(false)
+        engine?.setActive(false)
         super.onStop()
     }
 
     override fun onDestroy() {
-        session.close()
+        engine?.destroy()
+        engine = null
         super.onDestroy()
     }
 
-    // ---------- session setup + crash recovery ----------
+    // ---------- engine setup / switching ----------
 
-    // One GeckoRuntime per app process
-    private fun runtimeInstance(): GeckoRuntime =
-        runtime ?: GeckoRuntime.create(applicationContext).also { runtime = it }
-
-    // Ad / tracker blocking (lighter pages, less memory)
-    private fun applyBlocking(rt: GeckoRuntime) {
-        val cb = rt.settings.contentBlocking
-        if (blockOn()) {
-            cb.setEnhancedTrackingProtectionLevel(ContentBlocking.EtpLevel.STRICT)
-            cb.setAntiTracking(
-                ContentBlocking.AntiTracking.AD or
-                        ContentBlocking.AntiTracking.ANALYTIC or
-                        ContentBlocking.AntiTracking.SOCIAL or
-                        ContentBlocking.AntiTracking.CRYPTOMINING
-            )
+    private fun startEngine() {
+        val e: BrowserEngine = if (engineName() == "gecko") {
+            GeckoEngine(this, this, desktopOn())
         } else {
-            cb.setEnhancedTrackingProtectionLevel(ContentBlocking.EtpLevel.NONE)
-            cb.setAntiTracking(ContentBlocking.AntiTracking.NONE)
+            WebViewEngine(this, this, desktopOn(), imagesOff())
         }
+        e.attach(engineHost)
+        engine = e
     }
 
-    // Engine memory settings
-    private fun applyMemoryPrefs() {
-        val user = GeckoPreferenceController.PREF_BRANCH_USER
-        // keep fewer old pages in memory for the back button
-        GeckoPreferenceController.setGeckoPref("browser.sessionhistory.max_total_viewers", 1, user)
-        // smaller decoded-image cache (64 MB)
-        GeckoPreferenceController.setGeckoPref("image.mem.surfacecache.max_size_kb", 65536, user)
-        // don't pre-buffer video until it plays (2 = metadata only)
-        GeckoPreferenceController.setGeckoPref("media.preload.auto", 2, user)
-        // optional: block images entirely (2 = block, 1 = allow)
-        GeckoPreferenceController.setGeckoPref("permissions.default.image", if (imagesOff()) 2 else 1, user)
-    }
-
-    private fun createSession() {
-        val rt = runtimeInstance()
-        applyBlocking(rt)
-        applyMemoryPrefs()
-        session = GeckoSession()
-        applyDesktopMode()
-        setupDelegates()
-        session.open(rt)
-        geckoView.setSession(session)
-    }
-
-    // When a page crashes, its session is dead: throw it away and start a new one
-    private fun recoverSession(message: String) {
-        if (inFullscreen) setFullscreen(false)
+    // Start over with the same engine (used after a page crash)
+    private fun rebuildEngine(message: String) {
+        if (inFullscreen) onFullscreen(false, null)
+        engine?.destroy()
+        engine = null
         backEnabled = false
         forwardEnabled = false
-        lastUrl = ""
         hideBanner()
         progressBar.visibility = View.GONE
-        geckoView.releaseSession()
-        session.close()
-        createSession()
+        startEngine()
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-        load(home)
+        engine?.load(home)
     }
 
-    // ---------- GeckoView callbacks ----------
-
-    private fun allow(): GeckoResult<AllowOrDeny> = GeckoResult.fromValue(AllowOrDeny.ALLOW)
-    private fun deny(): GeckoResult<AllowOrDeny> = GeckoResult.fromValue(AllowOrDeny.DENY)
-
-    private fun setupDelegates() {
-        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
-            override fun onLocationChange(
-                s: GeckoSession,
-                url: String?,
-                perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
-                hasUserGesture: Boolean
-            ) {
-                if (url != null) {
-                    lastUrl = url
-                    if (!urlBar.hasFocus()) urlBar.setText(url)
-                }
-            }
-
-            override fun onCanGoBack(s: GeckoSession, canGoBack: Boolean) {
-                backEnabled = canGoBack
-            }
-
-            override fun onCanGoForward(s: GeckoSession, canGoForward: Boolean) {
-                forwardEnabled = canGoForward
-            }
-
-            override fun onLoadRequest(
-                s: GeckoSession,
-                request: GeckoSession.NavigationDelegate.LoadRequest
-            ): GeckoResult<AllowOrDeny>? {
-                val uriStr = request.uri
-                val scheme = Uri.parse(uriStr).scheme ?: ""
-                return when {
-                    scheme == "http" || scheme == "https" -> {
-                        if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) {
-                            geckoView.post { handleNewPage(uriStr) }
-                            deny()
-                        } else {
-                            val fixed = desktopUrl(uriStr)
-                            if (fixed != uriStr) {
-                                geckoView.post { session.loadUri(fixed) }
-                                deny()
-                            } else {
-                                allow()
-                            }
-                        }
-                    }
-                    isInternal(scheme) -> allow()
-                    else -> {
-                        geckoView.post { handleAppLink(Uri.parse(uriStr)) }
-                        deny()
-                    }
-                }
-            }
-
-            override fun onNewSession(s: GeckoSession, uri: String): GeckoResult<GeckoSession>? {
-                if (uri.startsWith("http")) {
-                    geckoView.post { handleNewPage(uri) }
-                }
-                return null
-            }
-        }
-
-        session.progressDelegate = object : GeckoSession.ProgressDelegate {
-            override fun onPageStart(s: GeckoSession, url: String) {
-                progressBar.visibility = View.VISIBLE
-            }
-
-            override fun onPageStop(s: GeckoSession, success: Boolean) {
-                progressBar.visibility = View.GONE
-            }
-
-            override fun onProgressChange(s: GeckoSession, value: Int) {
-                progressBar.progress = value
-            }
-        }
-
-        session.contentDelegate = object : GeckoSession.ContentDelegate {
-            override fun onFullScreen(s: GeckoSession, fullScreen: Boolean) {
-                setFullscreen(fullScreen)
-            }
-
-            override fun onCrash(s: GeckoSession) {
-                geckoView.post { recoverSession("That page crashed, so the browser restarted") }
-            }
-
-            override fun onKill(s: GeckoSession) {
-                geckoView.post { recoverSession("The page ran out of memory and was closed") }
-            }
-        }
+    private fun switchEngine(url: String) {
+        val next = if (engineName() == "gecko") "webview" else "gecko"
+        prefs.edit()
+            .putString("engine", next)
+            .putString("resumeUrl", url)
+            .apply()
+        recreate()
     }
 
-    // ---------- fullscreen video ----------
+    // ---------- callbacks from the engine ----------
 
-    private fun setFullscreen(enabled: Boolean) {
-        inFullscreen = enabled
-        topBar.visibility = if (enabled) View.GONE else View.VISIBLE
-        @Suppress("DEPRECATION")
-        window.decorView.systemUiVisibility = if (enabled) {
-            (View.SYSTEM_UI_FLAG_FULLSCREEN
+    override fun onUrlChanged(url: String) {
+        if (!urlBar.hasFocus()) urlBar.setText(url)
+    }
+
+    override fun onLoading(loading: Boolean, percent: Int) {
+        progressBar.visibility = if (loading) View.VISIBLE else View.GONE
+        progressBar.progress = percent
+    }
+
+    override fun onNavState(canGoBack: Boolean, canGoForward: Boolean) {
+        backEnabled = canGoBack
+        forwardEnabled = canGoForward
+    }
+
+    override fun onAppLink(uri: Uri) {
+        handleAppLink(uri)
+    }
+
+    override fun onNewPage(url: String) {
+        handleNewPage(url)
+    }
+
+    override fun onFullscreen(enabled: Boolean, customView: View?) {
+        val decor = window.decorView as FrameLayout
+        if (enabled) {
+            if (customView != null) {
+                fullscreenView = customView
+                decor.addView(
+                    customView,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                )
+            }
+            inFullscreen = true
+            topBar.visibility = View.GONE
+            @Suppress("DEPRECATION")
+            decor.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
                     or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                     or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                     or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                     or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                     or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         } else {
-            View.SYSTEM_UI_FLAG_VISIBLE
-        }
-        requestedOrientation = if (enabled) {
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        } else {
-            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            fullscreenView?.let { decor.removeView(it) }
+            fullscreenView = null
+            inFullscreen = false
+            topBar.visibility = View.VISIBLE
+            @Suppress("DEPRECATION")
+            decor.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
     }
 
-    // ---------- link helpers ----------
-
-    private fun isInternal(scheme: String): Boolean =
-        scheme in listOf("about", "data", "blob", "javascript", "resource", "view-source")
-
-    // In desktop mode, turn mobile addresses (m.example.com) into www.
-    private fun desktopUrl(url: String): String {
-        if (!desktopOn()) return url
-        val host = Uri.parse(url).host ?: return url
-        return if (host.startsWith("m.")) url.replaceFirst("//m.", "//www.") else url
+    override fun onEngineDied(message: String) {
+        rebuildEngine(message)
     }
 
-    private fun load(url: String) {
-        session.loadUri(desktopUrl(url))
+    override fun onNeedsGecko(url: String) {
+        showBanner("Google sign-in doesn't work in WebView. Tap Open to switch to GeckoView.") {
+            switchEngine(url)
+        }
     }
 
     // ---------- top banner (does not pause or dim the page) ----------
@@ -340,49 +242,29 @@ class MainActivity : Activity() {
 
     private fun handleNewPage(url: String) {
         if (!askNew()) {
-            load(url) // popup off = just open it here
+            engine?.load(url) // popup off = just open it here
             return
         }
         showBanner("This site wants to open a new page:\n$url") {
-            load(url)
+            engine?.load(url)
         }
     }
 
     // ---------- desktop site + settings ----------
 
-    private fun applyDesktopMode() {
-        val desktop = desktopOn()
-        session.settings.setUserAgentMode(
-            if (desktop) GeckoSessionSettings.USER_AGENT_MODE_DESKTOP
-            else GeckoSessionSettings.USER_AGENT_MODE_MOBILE
-        )
-        session.settings.setViewportMode(
-            if (desktop) GeckoSessionSettings.VIEWPORT_MODE_DESKTOP
-            else GeckoSessionSettings.VIEWPORT_MODE_MOBILE
-        )
-    }
-
     private fun setDesktop(enabled: Boolean) {
         prefs.edit().putBoolean("desktop", enabled).apply()
-        applyDesktopMode()
-        val fixed = desktopUrl(lastUrl)
-        if (lastUrl.isNotEmpty() && fixed != lastUrl) {
-            session.loadUri(fixed)
-        } else {
-            session.reload()
-        }
-    }
-
-    private fun setBlocking(enabled: Boolean) {
-        prefs.edit().putBoolean("block", enabled).apply()
-        applyBlocking(runtimeInstance())
-        session.reload()
+        val e = engine ?: return
+        e.applyDesktop(enabled)
+        val current = e.currentUrl()
+        val fixed = Links.desktopUrl(current, enabled)
+        if (current.isNotEmpty() && fixed != current) e.load(fixed) else e.reload()
     }
 
     private fun setImagesOff(enabled: Boolean) {
         prefs.edit().putBoolean("noImages", enabled).apply()
-        applyMemoryPrefs()
-        session.reload()
+        engine?.setImagesBlocked(enabled)
+        engine?.reload()
     }
 
     private fun showMenu(anchor: View) {
@@ -390,7 +272,12 @@ class MainActivity : Activity() {
         val desktopItem = popup.menu.add(Menu.NONE, 1, 0, "Desktop site")
         desktopItem.isCheckable = true
         desktopItem.isChecked = desktopOn()
-        popup.menu.add(Menu.NONE, 2, 1, "Settings")
+        popup.menu.add(
+            Menu.NONE, 2, 1,
+            if (engineName() == "gecko") "Switch to WebView (light, fast)"
+            else "Switch to GeckoView (Google sign-in)"
+        )
+        popup.menu.add(Menu.NONE, 3, 2, "Settings")
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -398,6 +285,10 @@ class MainActivity : Activity() {
                     true
                 }
                 2 -> {
+                    switchEngine(engine?.currentUrl() ?: "")
+                    true
+                }
+                3 -> {
                     showSettings()
                     true
                 }
@@ -412,20 +303,18 @@ class MainActivity : Activity() {
             "Desktop site",
             "Ask before opening apps",
             "Ask before opening new sites",
-            "Block ads and trackers",
-            "Save memory (block images)"
+            "Block images (WebView only)"
         )
-        val keys = arrayOf("desktop", "askApps", "askNew", "block", "noImages")
-        val defaults = booleanArrayOf(false, true, true, true, false)
-        val checked = BooleanArray(5) { prefs.getBoolean(keys[it], defaults[it]) }
+        val keys = arrayOf("desktop", "askApps", "askNew", "noImages")
+        val defaults = booleanArrayOf(false, true, true, false)
+        val checked = BooleanArray(4) { prefs.getBoolean(keys[it], defaults[it]) }
 
         AlertDialog.Builder(this)
-            .setTitle("Settings")
+            .setTitle("Settings (engine: " + (if (engineName() == "gecko") "GeckoView" else "WebView") + ")")
             .setMultiChoiceItems(items, checked) { _, which, isChecked ->
                 when (which) {
                     0 -> setDesktop(isChecked)
-                    3 -> setBlocking(isChecked)
-                    4 -> setImagesOff(isChecked)
+                    3 -> setImagesOff(isChecked)
                     else -> prefs.edit().putBoolean(keys[which], isChecked).apply()
                 }
             }
@@ -444,7 +333,7 @@ class MainActivity : Activity() {
             else -> "https://www.google.com/search?q=" + Uri.encode(q)
         }
         hideBanner()
-        load(url)
+        engine?.load(url)
         urlBar.clearFocus()
         val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
         imm.hideSoftInputFromWindow(urlBar.windowToken, 0)
@@ -453,8 +342,8 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
-            inFullscreen -> session.exitFullScreen()
-            backEnabled -> session.goBack()
+            inFullscreen -> engine?.exitFullscreen()
+            backEnabled -> engine?.goBack()
             else -> super.onBackPressed()
         }
     }
