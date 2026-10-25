@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.KeyEvent
 import android.view.Menu
 import android.view.View
@@ -45,6 +47,7 @@ class MainActivity : Activity(), EngineCallbacks {
     private fun askApps() = prefs.getBoolean("askApps", true)
     private fun askNew() = prefs.getBoolean("askNew", true)
     private fun imagesOff() = prefs.getBoolean("noImages", false)
+    private fun shareOn() = prefs.getBoolean("shareLogins", false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -85,9 +88,19 @@ class MainActivity : Activity(), EngineCallbacks {
             }
         }
 
+        // In WebView with sharing on, bring in logins saved by GeckoView
+        // (done before the first page loads, so the cookies are already there)
+        var imported = 0
+        if (engineName() == "webview" && shareOn()) {
+            imported = CookieSync.geckoToWebView(this)
+        }
+
         // After an engine switch, reopen the page that was open
         val resume = prefs.getString("resumeUrl", null)
         prefs.edit().remove("resumeUrl").apply()
+        if (!resume.isNullOrEmpty() && imported > 0) {
+            Toast.makeText(this, "Copied $imported cookies from GeckoView", Toast.LENGTH_SHORT).show()
+        }
         engine?.load(if (!resume.isNullOrEmpty()) resume else home)
     }
 
@@ -113,7 +126,7 @@ class MainActivity : Activity(), EngineCallbacks {
         val e: BrowserEngine = if (engineName() == "gecko") {
             GeckoEngine(this, this, desktopOn())
         } else {
-            WebViewEngine(this, this, desktopOn(), imagesOff())
+            WebViewEngine(this, this, desktopOn(), imagesOff(), shareOn())
         }
         e.attach(engineHost)
         engine = e
@@ -134,12 +147,19 @@ class MainActivity : Activity(), EngineCallbacks {
     }
 
     private fun switchEngine(url: String) {
-        val next = if (engineName() == "gecko") "webview" else "gecko"
+        val leavingGecko = engineName() == "gecko"
+        val next = if (leavingGecko) "webview" else "gecko"
         prefs.edit()
             .putString("engine", next)
             .putString("resumeUrl", url)
             .apply()
-        recreate()
+        if (leavingGecko && shareOn()) {
+            // give Firefox a moment to save any new login to disk first
+            Toast.makeText(this, "Saving logins...", Toast.LENGTH_SHORT).show()
+            Handler(Looper.getMainLooper()).postDelayed({ recreate() }, 1500)
+        } else {
+            recreate()
+        }
     }
 
     // ---------- callbacks from the engine ----------
@@ -267,6 +287,25 @@ class MainActivity : Activity(), EngineCallbacks {
         engine?.reload()
     }
 
+    // Changes the browser ID WebView uses, so WebView restarts on the current page
+    private fun setShareLogins(enabled: Boolean) {
+        prefs.edit().putBoolean("shareLogins", enabled).apply()
+        if (engineName() == "webview") {
+            prefs.edit().putString("resumeUrl", engine?.currentUrl() ?: "").apply()
+            recreate()
+        }
+    }
+
+    private fun syncNow() {
+        val n = CookieSync.geckoToWebView(this)
+        Toast.makeText(
+            this,
+            if (n > 0) "Copied $n cookies from GeckoView" else "No GeckoView logins found yet",
+            Toast.LENGTH_SHORT
+        ).show()
+        engine?.reload()
+    }
+
     private fun showMenu(anchor: View) {
         val popup = PopupMenu(this, anchor)
         val desktopItem = popup.menu.add(Menu.NONE, 1, 0, "Desktop site")
@@ -277,7 +316,10 @@ class MainActivity : Activity(), EngineCallbacks {
             if (engineName() == "gecko") "Switch to WebView (light, fast)"
             else "Switch to GeckoView (Google sign-in)"
         )
-        popup.menu.add(Menu.NONE, 3, 2, "Settings")
+        if (engineName() == "webview") {
+            popup.menu.add(Menu.NONE, 4, 2, "Sync logins from GeckoView now")
+        }
+        popup.menu.add(Menu.NONE, 3, 3, "Settings")
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -292,6 +334,10 @@ class MainActivity : Activity(), EngineCallbacks {
                     showSettings()
                     true
                 }
+                4 -> {
+                    syncNow()
+                    true
+                }
                 else -> false
             }
         }
@@ -303,11 +349,12 @@ class MainActivity : Activity(), EngineCallbacks {
             "Desktop site",
             "Ask before opening apps",
             "Ask before opening new sites",
-            "Block images (WebView only)"
+            "Block images (WebView only)",
+            "Share logins between engines (experimental)"
         )
-        val keys = arrayOf("desktop", "askApps", "askNew", "noImages")
-        val defaults = booleanArrayOf(false, true, true, false)
-        val checked = BooleanArray(4) { prefs.getBoolean(keys[it], defaults[it]) }
+        val keys = arrayOf("desktop", "askApps", "askNew", "noImages", "shareLogins")
+        val defaults = booleanArrayOf(false, true, true, false, false)
+        val checked = BooleanArray(5) { prefs.getBoolean(keys[it], defaults[it]) }
 
         AlertDialog.Builder(this)
             .setTitle("Settings (engine: " + (if (engineName() == "gecko") "GeckoView" else "WebView") + ")")
@@ -315,6 +362,7 @@ class MainActivity : Activity(), EngineCallbacks {
                 when (which) {
                     0 -> setDesktop(isChecked)
                     3 -> setImagesOff(isChecked)
+                    4 -> setShareLogins(isChecked)
                     else -> prefs.edit().putBoolean(keys[which], isChecked).apply()
                 }
             }
