@@ -1,10 +1,13 @@
 package com.example.browser
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -24,9 +27,12 @@ import android.widget.Toast
 
 class MainActivity : Activity(), EngineCallbacks {
 
+    private class Tab(var url: String, var title: String)
+
     private lateinit var engineHost: FrameLayout
     private lateinit var topBar: View
     private lateinit var urlBar: EditText
+    private lateinit var btnTabs: Button
     private lateinit var progressBar: ProgressBar
     private lateinit var banner: View
     private lateinit var bannerText: TextView
@@ -38,6 +44,9 @@ class MainActivity : Activity(), EngineCallbacks {
     private var forwardEnabled = false
     private var inFullscreen = false
     private var fullscreenView: View? = null
+
+    private val tabs = ArrayList<Tab>()
+    private var currentTab = 0
 
     private val home = "https://www.google.com"
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
@@ -56,12 +65,21 @@ class MainActivity : Activity(), EngineCallbacks {
         engineHost = findViewById(R.id.engineHost)
         topBar = findViewById(R.id.topBar)
         urlBar = findViewById(R.id.urlBar)
+        btnTabs = findViewById(R.id.btnTabs)
         progressBar = findViewById(R.id.progress)
         banner = findViewById(R.id.banner)
         bannerText = findViewById(R.id.bannerText)
         bannerOpen = findViewById(R.id.bannerOpen)
         bannerStay = findViewById(R.id.bannerStay)
 
+        // Older phones (Android 9 and below) need this permission for downloads
+        if (Build.VERSION.SDK_INT <= 28 &&
+            checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 1)
+        }
+
+        loadTabs()
         startEngine()
 
         findViewById<Button>(R.id.btnBack).setOnClickListener {
@@ -72,6 +90,9 @@ class MainActivity : Activity(), EngineCallbacks {
         }
         findViewById<Button>(R.id.btnReload).setOnClickListener {
             engine?.reload()
+        }
+        btnTabs.setOnClickListener {
+            showTabs()
         }
         findViewById<Button>(R.id.btnMenu).setOnClickListener { v ->
             showMenu(v)
@@ -98,10 +119,17 @@ class MainActivity : Activity(), EngineCallbacks {
         // After an engine switch, reopen the page that was open
         val resume = prefs.getString("resumeUrl", null)
         prefs.edit().remove("resumeUrl").apply()
-        if (!resume.isNullOrEmpty() && imported > 0) {
-            Toast.makeText(this, "Copied $imported cookies from GeckoView", Toast.LENGTH_SHORT).show()
+        if (!resume.isNullOrEmpty()) {
+            tabs[currentTab].url = resume
+            if (imported > 0) {
+                Toast.makeText(this, "Copied $imported cookies from GeckoView", Toast.LENGTH_SHORT).show()
+            }
         }
-        engine?.load(if (!resume.isNullOrEmpty()) resume else home)
+
+        updateTabButton()
+        val first = tabs[currentTab].url
+        urlBar.setText(first)
+        engine?.load(first)
     }
 
     override fun onStart() {
@@ -110,6 +138,7 @@ class MainActivity : Activity(), EngineCallbacks {
     }
 
     override fun onStop() {
+        saveTabs()
         engine?.setActive(false)
         super.onStop()
     }
@@ -118,6 +147,103 @@ class MainActivity : Activity(), EngineCallbacks {
         engine?.destroy()
         engine = null
         super.onDestroy()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        engine?.onActivityResult(requestCode, resultCode, data)
+    }
+
+    // ---------- tabs ----------
+
+    private fun saveTabs() {
+        val data = tabs.joinToString("\u0001") {
+            it.url.replace("\u0001", "").replace("\u0002", "") + "\u0002" +
+                    it.title.replace("\u0001", "").replace("\u0002", "")
+        }
+        prefs.edit().putString("tabsData", data).putInt("tabsCurrent", currentTab).apply()
+    }
+
+    private fun loadTabs() {
+        tabs.clear()
+        val data = prefs.getString("tabsData", "") ?: ""
+        if (data.isNotEmpty()) {
+            for (part in data.split("\u0001")) {
+                val i = part.indexOf("\u0002")
+                if (i >= 0) tabs.add(Tab(part.substring(0, i), part.substring(i + 1)))
+            }
+        }
+        if (tabs.isEmpty()) tabs.add(Tab(home, ""))
+        currentTab = prefs.getInt("tabsCurrent", 0).coerceIn(0, tabs.size - 1)
+    }
+
+    private fun updateTabButton() {
+        btnTabs.text = tabs.size.toString()
+    }
+
+    // Only the current tab is kept loaded (saves memory); others reload when selected
+    private fun switchToTab(index: Int) {
+        if (index !in tabs.indices) return
+        if (inFullscreen) onFullscreen(false, null)
+        hideBanner()
+        engine?.destroy()
+        engine = null
+        currentTab = index
+        backEnabled = false
+        forwardEnabled = false
+        progressBar.visibility = View.GONE
+        startEngine()
+        updateTabButton()
+        saveTabs()
+        val url = tabs[currentTab].url
+        urlBar.setText(url)
+        engine?.load(url)
+    }
+
+    private fun openNewTab(url: String) {
+        tabs.add(Tab(url, ""))
+        switchToTab(tabs.size - 1)
+    }
+
+    private fun closeTab(index: Int) {
+        if (index !in tabs.indices) return
+        if (tabs.size == 1) {
+            tabs[0] = Tab(home, "")
+            switchToTab(0)
+            return
+        }
+        tabs.removeAt(index)
+        if (index == currentTab) {
+            switchToTab(minOf(index, tabs.size - 1))
+        } else {
+            if (index < currentTab) currentTab -= 1
+            updateTabButton()
+            saveTabs()
+        }
+    }
+
+    private fun showTabs() {
+        val labels = tabs.mapIndexed { i, t ->
+            val name = if (t.title.isNotEmpty()) t.title else t.url
+            (if (i == currentTab) "● " else "    ") + name.take(60)
+        }.toTypedArray()
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Tabs (${tabs.size}) - hold a tab to close it")
+            .setItems(labels) { _, which ->
+                if (which != currentTab) switchToTab(which)
+            }
+            .setPositiveButton("New tab") { _, _ -> openNewTab(home) }
+            .setNeutralButton("Close this tab") { _, _ -> closeTab(currentTab) }
+            .setNegativeButton("Back", null)
+            .create()
+        dialog.show()
+        dialog.listView.setOnItemLongClickListener { _, _, pos, _ ->
+            dialog.dismiss()
+            closeTab(pos)
+            true
+        }
     }
 
     // ---------- engine setup / switching ----------
@@ -141,14 +267,18 @@ class MainActivity : Activity(), EngineCallbacks {
         forwardEnabled = false
         hideBanner()
         progressBar.visibility = View.GONE
+        tabs[currentTab].url = home
+        tabs[currentTab].title = ""
         startEngine()
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        urlBar.setText(home)
         engine?.load(home)
     }
 
     private fun switchEngine(url: String) {
         val leavingGecko = engineName() == "gecko"
         val next = if (leavingGecko) "webview" else "gecko"
+        saveTabs()
         prefs.edit()
             .putString("engine", next)
             .putString("resumeUrl", url)
@@ -165,7 +295,12 @@ class MainActivity : Activity(), EngineCallbacks {
     // ---------- callbacks from the engine ----------
 
     override fun onUrlChanged(url: String) {
+        tabs.getOrNull(currentTab)?.url = url
         if (!urlBar.hasFocus()) urlBar.setText(url)
+    }
+
+    override fun onTitleChanged(title: String) {
+        tabs.getOrNull(currentTab)?.title = title
     }
 
     override fun onLoading(loading: Boolean, percent: Int) {
@@ -262,11 +397,11 @@ class MainActivity : Activity(), EngineCallbacks {
 
     private fun handleNewPage(url: String) {
         if (!askNew()) {
-            engine?.load(url) // popup off = just open it here
+            openNewTab(url) // popup off = just open it in a new tab
             return
         }
         showBanner("This site wants to open a new page:\n$url") {
-            engine?.load(url)
+            openNewTab(url)
         }
     }
 
@@ -291,6 +426,7 @@ class MainActivity : Activity(), EngineCallbacks {
     private fun setShareLogins(enabled: Boolean) {
         prefs.edit().putBoolean("shareLogins", enabled).apply()
         if (engineName() == "webview") {
+            saveTabs()
             prefs.edit().putString("resumeUrl", engine?.currentUrl() ?: "").apply()
             recreate()
         }
@@ -306,20 +442,32 @@ class MainActivity : Activity(), EngineCallbacks {
         engine?.reload()
     }
 
+    private fun removeCopiedLogins() {
+        val n = CookieSync.removeCopied(this)
+        Toast.makeText(
+            this,
+            if (n > 0) "Removed $n copied cookies" else "No copied logins to remove",
+            Toast.LENGTH_SHORT
+        ).show()
+        engine?.reload()
+    }
+
     private fun showMenu(anchor: View) {
         val popup = PopupMenu(this, anchor)
         val desktopItem = popup.menu.add(Menu.NONE, 1, 0, "Desktop site")
         desktopItem.isCheckable = true
         desktopItem.isChecked = desktopOn()
+        popup.menu.add(Menu.NONE, 6, 1, "New tab")
         popup.menu.add(
-            Menu.NONE, 2, 1,
+            Menu.NONE, 2, 2,
             if (engineName() == "gecko") "Switch to WebView (light, fast)"
             else "Switch to GeckoView (Google sign-in)"
         )
         if (engineName() == "webview") {
-            popup.menu.add(Menu.NONE, 4, 2, "Sync logins from GeckoView now")
+            popup.menu.add(Menu.NONE, 4, 3, "Sync logins from GeckoView now")
+            popup.menu.add(Menu.NONE, 5, 4, "Remove copied logins")
         }
-        popup.menu.add(Menu.NONE, 3, 3, "Settings")
+        popup.menu.add(Menu.NONE, 3, 5, "Settings")
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -336,6 +484,14 @@ class MainActivity : Activity(), EngineCallbacks {
                 }
                 4 -> {
                     syncNow()
+                    true
+                }
+                5 -> {
+                    removeCopiedLogins()
+                    true
+                }
+                6 -> {
+                    openNewTab(home)
                     true
                 }
                 else -> false
