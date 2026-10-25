@@ -2,8 +2,11 @@ package com.example.browser
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Build
 import android.os.Message
 import android.view.View
 import android.view.ViewGroup
@@ -19,12 +22,16 @@ import androidx.webkit.UserAgentMetadata
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import java.io.File
 import org.mozilla.geckoview.AllowOrDeny
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.GeckoView
+
+// Must match the GeckoView version in app/build.gradle.kts (major.minor only)
+private const val GECKO_VERSION = "150.0"
 
 // ---------- what an engine tells the app ----------
 
@@ -81,6 +88,117 @@ object Links {
 }
 
 // =====================================================================
+//  Copies logins (cookies) saved by GeckoView into WebView
+// =====================================================================
+
+object CookieSync {
+
+    private class Row(
+        val name: String,
+        val value: String,
+        val host: String,
+        val path: String,
+        val expirySec: Long,
+        val secure: Boolean,
+        val httpOnly: Boolean,
+        val sameSite: Int
+    )
+
+    // Looks for Firefox's cookie file anywhere inside the app's own storage
+    private fun findCookieDb(dir: File, depth: Int): File? {
+        if (depth > 6) return null
+        val children = dir.listFiles() ?: return null
+        for (f in children) {
+            if (f.isFile && f.name == "cookies.sqlite") return f
+        }
+        for (f in children) {
+            if (f.isDirectory) {
+                val found = findCookieDb(f, depth + 1)
+                if (found != null) return found
+            }
+        }
+        return null
+    }
+
+    // Returns how many cookies were copied (0 if none or if anything went wrong)
+    fun geckoToWebView(context: Context): Int {
+        try {
+            val src = findCookieDb(context.dataDir, 0) ?: return 0
+
+            // Work on a copy so Firefox's live file is never touched
+            val tmpDir = File(context.cacheDir, "ckcopy")
+            tmpDir.deleteRecursively()
+            tmpDir.mkdirs()
+            for (suffix in listOf("", "-wal", "-shm")) {
+                val f = File(src.path + suffix)
+                if (f.exists()) f.copyTo(File(tmpDir, "cookies.sqlite$suffix"), overwrite = true)
+            }
+
+            val rows = ArrayList<Row>()
+            val db = SQLiteDatabase.openDatabase(
+                File(tmpDir, "cookies.sqlite").path, null, SQLiteDatabase.OPEN_READWRITE
+            )
+            try {
+                db.rawQuery(
+                    "SELECT name, value, host, path, expiry, isSecure, isHttpOnly, sameSite, originAttributes FROM moz_cookies",
+                    null
+                ).use { c ->
+                    while (c.moveToNext()) {
+                        // skip cookies from containers / third-party partitions
+                        if ((c.getString(8) ?: "").isNotEmpty()) continue
+                        var expiry = c.getLong(4)
+                        if (expiry > 100_000_000_000L) expiry /= 1000 // milliseconds -> seconds
+                        rows.add(
+                            Row(
+                                c.getString(0) ?: "",
+                                c.getString(1) ?: "",
+                                c.getString(2) ?: "",
+                                c.getString(3) ?: "/",
+                                expiry,
+                                c.getInt(5) != 0,
+                                c.getInt(6) != 0,
+                                c.getInt(7)
+                            )
+                        )
+                    }
+                }
+            } finally {
+                db.close()
+            }
+
+            val cm = CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            val now = System.currentTimeMillis() / 1000
+            var count = 0
+            for (r in rows) {
+                if (r.name.isEmpty() || r.host.isEmpty()) continue
+                if (r.expirySec <= now) continue // expired
+                val bareHost = r.host.trimStart('.')
+                val sb = StringBuilder()
+                sb.append(r.name).append('=').append(r.value)
+                sb.append("; Path=").append(if (r.path.isEmpty()) "/" else r.path)
+                if (r.host.startsWith(".")) sb.append("; Domain=").append(r.host)
+                sb.append("; Max-Age=").append(r.expirySec - now)
+                if (r.secure) sb.append("; Secure")
+                if (r.httpOnly) sb.append("; HttpOnly")
+                when (r.sameSite) {
+                    1 -> sb.append("; SameSite=Lax")
+                    2 -> sb.append("; SameSite=Strict")
+                    0 -> if (r.secure) sb.append("; SameSite=None")
+                }
+                cm.setCookie("https://$bareHost/", sb.toString())
+                count++
+            }
+            cm.flush()
+            tmpDir.deleteRecursively()
+            return count
+        } catch (e: Exception) {
+            return 0
+        }
+    }
+}
+
+// =====================================================================
 //  WebView engine (Chrome's engine, built into the phone)
 // =====================================================================
 
@@ -88,7 +206,8 @@ class WebViewEngine(
     private val activity: Activity,
     private val cb: EngineCallbacks,
     private var desktop: Boolean,
-    private var imagesBlocked: Boolean
+    private var imagesBlocked: Boolean,
+    private val shareUa: Boolean
 ) : BrowserEngine {
 
     private lateinit var web: WebView
@@ -104,7 +223,7 @@ class WebViewEngine(
 
     // Runs before every page's own scripts when desktop mode is on:
     // forces a wide desktop layout and hides touch-screen signals
-    private val desktopJs = """
+    private val desktopJsTemplate = """
         (function () {
           try {
             var W = 1280;
@@ -127,7 +246,7 @@ class WebViewEngine(
             }).observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['content'] });
             document.addEventListener('DOMContentLoaded', fixMeta);
             Object.defineProperty(navigator, 'maxTouchPoints', { get: function () { return 0; } });
-            Object.defineProperty(navigator, 'platform', { get: function () { return 'Win32'; } });
+            Object.defineProperty(navigator, 'platform', { get: function () { return '__PLATFORM__'; } });
           } catch (e) {}
         })();
     """.trimIndent()
@@ -160,12 +279,21 @@ class WebViewEngine(
             WebSettingsCompat.setRequestedWithHeaderOriginAllowList(s, emptySet())
         }
 
-        // Build the two browser IDs from the phone's real WebView version
         val base = s.userAgentString
         chromeVersion = Regex("Chrome/([0-9.]+)").find(base)?.groupValues?.get(1) ?: "124.0.0.0"
-        mobileUA = base.replace("; wv", "").replace("Version/4.0 ", "")
-        desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/$chromeVersion Safari/537.36"
+        if (shareUa) {
+            // Same browser ID that GeckoView sends
+            val androidVersion = Build.VERSION.RELEASE
+            mobileUA = "Mozilla/5.0 (Android $androidVersion; Mobile; rv:$GECKO_VERSION) " +
+                    "Gecko/$GECKO_VERSION Firefox/$GECKO_VERSION"
+            desktopUA = "Mozilla/5.0 (X11; Linux x86_64; rv:$GECKO_VERSION) " +
+                    "Gecko/20100101 Firefox/$GECKO_VERSION"
+        } else {
+            // Chrome-style IDs built from the phone's real WebView version
+            mobileUA = base.replace("; wv", "").replace("Version/4.0 ", "")
+            desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/$chromeVersion Safari/537.36"
+        }
 
         applyDesktop(desktop)
         setImagesBlocked(imagesBlocked)
@@ -311,8 +439,8 @@ class WebViewEngine(
         desktop = enabled
         web.settings.userAgentString = if (enabled) desktopUA else mobileUA
 
-        // Client hints (what navigator.userAgentData and Sec-CH-UA-* headers say)
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.USER_AGENT_METADATA)) {
+        // Client hints (only in Chrome-style mode; the Firefox ID doesn't use them)
+        if (!shareUa && WebViewFeature.isFeatureSupported(WebViewFeature.USER_AGENT_METADATA)) {
             try {
                 WebSettingsCompat.setUserAgentMetadata(
                     web.settings,
@@ -328,7 +456,8 @@ class WebViewEngine(
         desktopScript = null
         if (enabled && WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             try {
-                desktopScript = WebViewCompat.addDocumentStartJavaScript(web, desktopJs, setOf("*"))
+                val js = desktopJsTemplate.replace("__PLATFORM__", if (shareUa) "Linux x86_64" else "Win32")
+                desktopScript = WebViewCompat.addDocumentStartJavaScript(web, js, setOf("*"))
             } catch (e: Exception) {
                 // ignore: layout falls back to the site's own choice
             }
