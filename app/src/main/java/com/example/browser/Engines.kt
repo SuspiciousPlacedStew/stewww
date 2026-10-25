@@ -2,21 +2,29 @@ package com.example.browser
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.database.sqlite.SQLiteDatabase
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.Message
+import android.provider.MediaStore
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.URLUtil
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.Toast
 import androidx.webkit.ScriptHandler
 import androidx.webkit.UserAgentMetadata
 import androidx.webkit.WebSettingsCompat
@@ -29,14 +37,25 @@ import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoSessionSettings
 import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.WebResponse
 
 // Must match the GeckoView version in app/build.gradle.kts (major.minor only)
 private const val GECKO_VERSION = "150.0"
+
+// request code used for the file picker (uploads)
+private const val REQ_FILE = 4711
+
+private fun toastOn(activity: Activity, message: String) {
+    activity.runOnUiThread {
+        Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
+    }
+}
 
 // ---------- what an engine tells the app ----------
 
 interface EngineCallbacks {
     fun onUrlChanged(url: String)
+    fun onTitleChanged(title: String)
     fun onLoading(loading: Boolean, percent: Int)
     fun onNavState(canGoBack: Boolean, canGoForward: Boolean)
     fun onAppLink(uri: Uri)
@@ -59,6 +78,7 @@ interface BrowserEngine {
     fun currentUrl(): String
     fun setActive(active: Boolean)
     fun exitFullscreen()
+    fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {}
     fun destroy()
 }
 
@@ -88,10 +108,15 @@ object Links {
 }
 
 // =====================================================================
-//  Copies logins (cookies) saved by GeckoView into WebView
+//  Copies logins (cookies) saved by GeckoView into WebView,
+//  and can remove exactly the cookies it copied
 // =====================================================================
 
 object CookieSync {
+
+    private const val PREFS = "cookiesync"
+    private const val KEY = "copied"
+    private const val SEP = "\u0001"
 
     private class Row(
         val name: String,
@@ -169,6 +194,7 @@ object CookieSync {
             val cm = CookieManager.getInstance()
             cm.setAcceptCookie(true)
             val now = System.currentTimeMillis() / 1000
+            val copied = HashSet<String>()
             var count = 0
             for (r in rows) {
                 if (r.name.isEmpty() || r.host.isEmpty()) continue
@@ -187,14 +213,48 @@ object CookieSync {
                     0 -> if (r.secure) sb.append("; SameSite=None")
                 }
                 cm.setCookie("https://$bareHost/", sb.toString())
+                copied.add(r.host + SEP + r.name + SEP + r.path)
                 count++
             }
             cm.flush()
             tmpDir.deleteRecursively()
+
+            // remember what we copied so it can be removed later
+            if (count > 0) {
+                val sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                val all = HashSet<String>(sp.getStringSet(KEY, emptySet()) ?: emptySet())
+                all.addAll(copied)
+                sp.edit().putStringSet(KEY, all).apply()
+            }
             return count
         } catch (e: Exception) {
             return 0
         }
+    }
+
+    // Removes only the cookies that were copied from GeckoView
+    fun removeCopied(context: Context): Int {
+        val sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val set = sp.getStringSet(KEY, emptySet()) ?: emptySet()
+        val cm = CookieManager.getInstance()
+        var n = 0
+        for (entry in set) {
+            val p = entry.split(SEP)
+            if (p.size < 3) continue
+            val host = p[0]
+            val name = p[1]
+            val path = p[2]
+            val bare = host.trimStart('.')
+            val sb = StringBuilder()
+            sb.append(name).append("=; Path=").append(if (path.isEmpty()) "/" else path)
+            if (host.startsWith(".")) sb.append("; Domain=").append(host)
+            sb.append("; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+            cm.setCookie("https://$bare/", sb.toString())
+            n++
+        }
+        cm.flush()
+        sp.edit().remove(KEY).apply()
+        return n
     }
 }
 
@@ -216,6 +276,7 @@ class WebViewEngine(
     private var customView: View? = null
     private var customCallback: WebChromeClient.CustomViewCallback? = null
     private var desktopScript: ScriptHandler? = null
+    private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var mobileUA = ""
     private var desktopUA = ""
     private var chromeVersion = "124.0.0.0"
@@ -298,19 +359,27 @@ class WebViewEngine(
         applyDesktop(desktop)
         setImagesBlocked(imagesBlocked)
 
+        // Downloads go through Android's download manager
+        web.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+            startDownload(url, userAgent, contentDisposition, mimetype)
+        }
+
         web.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                if (destroyed) return
                 cb.onUrlChanged(url)
                 cb.onLoading(true, 0)
             }
 
             override fun onPageFinished(view: WebView, url: String) {
+                if (destroyed) return
                 cb.onLoading(false, 100)
                 CookieManager.getInstance().flush()
                 cb.onNavState(view.canGoBack(), view.canGoForward())
             }
 
             override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
+                if (destroyed) return
                 cb.onUrlChanged(url)
                 cb.onNavState(view.canGoBack(), view.canGoForward())
             }
@@ -338,6 +407,7 @@ class WebViewEngine(
             }
 
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                if (destroyed) return true
                 val message = if (detail.didCrash()) {
                     "That page crashed, so the browser restarted"
                 } else {
@@ -350,7 +420,13 @@ class WebViewEngine(
 
         web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView, newProgress: Int) {
+                if (destroyed) return
                 cb.onLoading(newProgress < 100, newProgress)
+            }
+
+            override fun onReceivedTitle(view: WebView, title: String?) {
+                if (destroyed) return
+                if (title != null) cb.onTitleChanged(title)
             }
 
             override fun onShowCustomView(view: View, callback: WebChromeClient.CustomViewCallback) {
@@ -365,6 +441,23 @@ class WebViewEngine(
 
             override fun onHideCustomView() {
                 exitFullscreen()
+            }
+
+            // Uploads: open Android's file picker
+            override fun onShowFileChooser(
+                view: WebView,
+                callback: ValueCallback<Array<Uri>>,
+                params: WebChromeClient.FileChooserParams
+            ): Boolean {
+                filePathCallback?.onReceiveValue(null)
+                filePathCallback = callback
+                return try {
+                    activity.startActivityForResult(params.createIntent(), REQ_FILE)
+                    true
+                } catch (e: Exception) {
+                    filePathCallback = null
+                    false
+                }
             }
 
             override fun onCreateWindow(
@@ -411,6 +504,36 @@ class WebViewEngine(
                 return true
             }
         }
+    }
+
+    private fun startDownload(url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
+        val scheme = Uri.parse(url).scheme ?: ""
+        if (scheme != "http" && scheme != "https") {
+            toastOn(activity, "This kind of download isn't supported yet")
+            return
+        }
+        try {
+            val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
+            val request = DownloadManager.Request(Uri.parse(url))
+            if (!mimeType.isNullOrEmpty()) request.setMimeType(mimeType)
+            val cookie = CookieManager.getInstance().getCookie(url)
+            if (!cookie.isNullOrEmpty()) request.addRequestHeader("Cookie", cookie)
+            if (!userAgent.isNullOrEmpty()) request.addRequestHeader("User-Agent", userAgent)
+            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+            val dm = activity.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            dm.enqueue(request)
+            toastOn(activity, "Downloading $name")
+        } catch (e: Exception) {
+            toastOn(activity, "Download failed")
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode != REQ_FILE) return
+        val callback = filePathCallback ?: return
+        filePathCallback = null
+        callback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
     }
 
     private fun desktopMetadata(): UserAgentMetadata {
@@ -492,6 +615,8 @@ class WebViewEngine(
     override fun destroy() {
         if (destroyed) return
         destroyed = true
+        filePathCallback?.onReceiveValue(null)
+        filePathCallback = null
         desktopScript?.remove()
         web.stopLoading()
         container.removeView(web)
@@ -520,6 +645,10 @@ class GeckoEngine(
     private var lastUrl = ""
     private var backOk = false
     private var forwardOk = false
+    private var destroyed = false
+
+    private var pendingPrompt: GeckoSession.PromptDelegate.FilePrompt? = null
+    private var pendingResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? = null
 
     override fun attach(container: FrameLayout) {
         this.container = container
@@ -550,6 +679,7 @@ class GeckoEngine(
                 perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
                 hasUserGesture: Boolean
             ) {
+                if (destroyed) return
                 if (url != null) {
                     lastUrl = url
                     cb.onUrlChanged(url)
@@ -557,11 +687,13 @@ class GeckoEngine(
             }
 
             override fun onCanGoBack(s: GeckoSession, canGoBack: Boolean) {
+                if (destroyed) return
                 backOk = canGoBack
                 cb.onNavState(backOk, forwardOk)
             }
 
             override fun onCanGoForward(s: GeckoSession, canGoForward: Boolean) {
+                if (destroyed) return
                 forwardOk = canGoForward
                 cb.onNavState(backOk, forwardOk)
             }
@@ -575,12 +707,12 @@ class GeckoEngine(
                 return when {
                     scheme == "http" || scheme == "https" -> {
                         if (request.target == GeckoSession.NavigationDelegate.TARGET_WINDOW_NEW) {
-                            geckoView.post { cb.onNewPage(uriStr) }
+                            geckoView.post { if (!destroyed) cb.onNewPage(uriStr) }
                             deny()
                         } else {
                             val fixed = Links.desktopUrl(uriStr, desktop)
                             if (fixed != uriStr) {
-                                geckoView.post { session.loadUri(fixed) }
+                                geckoView.post { if (!destroyed) session.loadUri(fixed) }
                                 deny()
                             } else {
                                 allow()
@@ -589,7 +721,7 @@ class GeckoEngine(
                     }
                     Links.isInternal(scheme) -> allow()
                     else -> {
-                        geckoView.post { cb.onAppLink(Uri.parse(uriStr)) }
+                        geckoView.post { if (!destroyed) cb.onAppLink(Uri.parse(uriStr)) }
                         deny()
                     }
                 }
@@ -597,7 +729,7 @@ class GeckoEngine(
 
             override fun onNewSession(s: GeckoSession, uri: String): GeckoResult<GeckoSession>? {
                 if (uri.startsWith("http")) {
-                    geckoView.post { cb.onNewPage(uri) }
+                    geckoView.post { if (!destroyed) cb.onNewPage(uri) }
                 }
                 return null
             }
@@ -605,31 +737,138 @@ class GeckoEngine(
 
         session.progressDelegate = object : GeckoSession.ProgressDelegate {
             override fun onPageStart(s: GeckoSession, url: String) {
+                if (destroyed) return
                 cb.onLoading(true, 0)
             }
 
             override fun onPageStop(s: GeckoSession, success: Boolean) {
+                if (destroyed) return
                 cb.onLoading(false, 100)
             }
 
             override fun onProgressChange(s: GeckoSession, value: Int) {
+                if (destroyed) return
                 cb.onLoading(true, value)
             }
         }
 
         session.contentDelegate = object : GeckoSession.ContentDelegate {
             override fun onFullScreen(s: GeckoSession, fullScreen: Boolean) {
+                if (destroyed) return
                 cb.onFullscreen(fullScreen, null)
             }
 
+            override fun onTitleChange(s: GeckoSession, title: String?) {
+                if (destroyed) return
+                if (title != null) cb.onTitleChanged(title)
+            }
+
+            // Downloads: GeckoView hands us the file as a stream
+            override fun onExternalResponse(s: GeckoSession, response: WebResponse) {
+                saveDownload(response)
+            }
+
             override fun onCrash(s: GeckoSession) {
-                geckoView.post { cb.onEngineDied("That page crashed, so the browser restarted") }
+                geckoView.post { if (!destroyed) cb.onEngineDied("That page crashed, so the browser restarted") }
             }
 
             override fun onKill(s: GeckoSession) {
-                geckoView.post { cb.onEngineDied("The page ran out of memory and was closed") }
+                geckoView.post { if (!destroyed) cb.onEngineDied("The page ran out of memory and was closed") }
             }
         }
+
+        // Uploads: open Android's file picker
+        session.promptDelegate = object : GeckoSession.PromptDelegate {
+            override fun onFilePrompt(
+                s: GeckoSession,
+                prompt: GeckoSession.PromptDelegate.FilePrompt
+            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                // finish any earlier prompt first
+                val oldPrompt = pendingPrompt
+                val oldResult = pendingResult
+                if (oldPrompt != null && oldResult != null) {
+                    oldResult.complete(oldPrompt.dismiss())
+                }
+                val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                pendingPrompt = prompt
+                pendingResult = result
+
+                val intent = Intent(Intent.ACTION_GET_CONTENT)
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.type = "*/*"
+                val types = prompt.mimeTypes
+                if (types != null && types.isNotEmpty()) {
+                    intent.putExtra(Intent.EXTRA_MIME_TYPES, types)
+                }
+                try {
+                    activity.startActivityForResult(intent, REQ_FILE)
+                } catch (e: Exception) {
+                    pendingPrompt = null
+                    pendingResult = null
+                    return GeckoResult.fromValue(prompt.dismiss())
+                }
+                return result
+            }
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode != REQ_FILE) return
+        val prompt = pendingPrompt ?: return
+        val result = pendingResult ?: return
+        pendingPrompt = null
+        pendingResult = null
+        val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
+        if (uri != null) {
+            result.complete(prompt.confirm(activity.applicationContext, uri))
+        } else {
+            result.complete(prompt.dismiss())
+        }
+    }
+
+    private fun headerValue(headers: Map<String, String>, key: String): String? =
+        headers.entries.firstOrNull { it.key.equals(key, ignoreCase = true) }?.value
+
+    private fun saveDownload(response: WebResponse) {
+        val body = response.body
+        if (body == null) {
+            toastOn(activity, "Download failed")
+            return
+        }
+        val mime = headerValue(response.headers, "content-type")?.substringBefore(';')?.trim()
+        val name = URLUtil.guessFileName(response.uri, headerValue(response.headers, "content-disposition"), mime)
+        toastOn(activity, "Downloading $name")
+        Thread {
+            try {
+                if (Build.VERSION.SDK_INT >= 29) {
+                    val resolver = activity.contentResolver
+                    val values = ContentValues()
+                    values.put(MediaStore.Downloads.DISPLAY_NAME, name)
+                    if (!mime.isNullOrEmpty()) values.put(MediaStore.Downloads.MIME_TYPE, mime)
+                    values.put(MediaStore.Downloads.IS_PENDING, 1)
+                    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IllegalStateException("no uri")
+                    val out = resolver.openOutputStream(uri) ?: throw IllegalStateException("no stream")
+                    out.use { body.copyTo(it) }
+                    values.clear()
+                    values.put(MediaStore.Downloads.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                } else {
+                    val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    dir.mkdirs()
+                    File(dir, name).outputStream().use { body.copyTo(it) }
+                }
+                toastOn(activity, "Saved to Downloads: $name")
+            } catch (e: Exception) {
+                toastOn(activity, "Download failed")
+            } finally {
+                try {
+                    body.close()
+                } catch (e: Exception) {
+                    // ignore
+                }
+            }
+        }.start()
     }
 
     override fun applyDesktop(enabled: Boolean) {
@@ -665,6 +904,13 @@ class GeckoEngine(
     }
 
     override fun destroy() {
+        if (destroyed) return
+        destroyed = true
+        val p = pendingPrompt
+        val r = pendingResult
+        if (p != null && r != null) r.complete(p.dismiss())
+        pendingPrompt = null
+        pendingResult = null
         geckoView.releaseSession()
         session.close()
         container.removeView(geckoView)
